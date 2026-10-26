@@ -288,6 +288,10 @@ agent 继续思考、连着调十几个工具（可能几分钟）
 
 写插件、尤其是给 DSH 写带状态通道的插件的话，值得先看一遍。
 
+想让微信那头的 agent **像真人一样聊天**（多段短消息、颜文字、表情包、
+不说 AI 味的客套话）？拿 **[PROMPT-ROLEPLAY.md](./PROMPT-ROLEPLAY.md)**
+里的模板填上角色设定直接用。
+
 ---
 
 ## 文件结构
@@ -301,6 +305,8 @@ dsh-wechat-clawbot/
 │   ├── selftest.mjs           协议层自检（默认离线，--live 打真实接口）
 │   ├── integration.mjs        插件主流程集成测试（假 ctx + 假服务端）
 │   └── verify-dsh-contract.mjs 用真实 DSH 依赖验证插件遵守其契约
+├── GOTCHAS.md           完整踩坑实录（从本 README 链接过去）
+├── PROMPT-ROLEPLAY.md   微信真人感角色扮演提示词模板
 ├── cordis.patch.yml    把插件插入 profile 配置树
 └── package.json
 ```
