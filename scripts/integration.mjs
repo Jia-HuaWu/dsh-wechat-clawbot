@@ -1,4 +1,4 @@
-/**
+﻿/**
  * scripts/integration.mjs — 用假 ctx + 假 iLink 服务端跑通插件主流程。
  *
  * 验证的是**插件本身**：入站消息 → 驱动 agent → 收集回复 → 发回微信，
@@ -411,12 +411,24 @@ function makeRes() {
     status: 0,
     headers: null,
     body: null,
+    raw: null,
     writeHead(status, headers) {
       this.status = status
       this.headers = headers
     },
     end(payload) {
-      this.body = payload ? JSON.parse(payload) : null
+      this.raw = payload
+      // JSON 路由返回 JSON，page 路由返回 HTML —— 按内容类型解析，
+      // HTML 存到 body 原样（断言用正则匹配）。
+      if (!payload) {
+        this.body = null
+        return
+      }
+      if (this.headers?.['Content-Type']?.includes('application/json')) {
+        this.body = JSON.parse(payload)
+      } else {
+        this.body = payload
+      }
     },
   }
 }
@@ -663,7 +675,49 @@ await test('wechat_send_message 符合 output 契约', () => {
   // 返回裸字符串会在工具结果落地时抛 "content.some is not a function"。
   assert.ok(Array.isArray(tool.output.render({}, { chunks: 1 })))
   assert.equal(tool.output.schema.type, 'object')
-  assert.deepEqual(tool.parameters.required, ['to', 'text'])
+  // to 必填；text 与 messages 二选一（运行时校验，schema 层不强制）。
+  assert.deepEqual(tool.parameters.required, ['to'])
+})
+
+await test('wechat_send_image 存在且符合契约', () => {
+  const tool = ctx._internals.tools.get('wechat_send_image')
+  assert.ok(tool, '主动发图工具应该注册好')
+  assert.equal(typeof tool.output.render, 'function')
+  assert.ok(Array.isArray(tool.output.render({}, { ok: true, messageId: 'm1' })))
+  assert.deepEqual(tool.parameters.required, ['to', 'imagePath'])
+})
+
+await test('wechat_send_message 支持 messages 多条推送', async () => {
+  const tool = ctx._internals.tools.get('wechat_send_message')
+  const before = server.sentTexts().length
+  const value = await tool.execute({
+    to: 'friend@im.wechat',
+    messages: ['第一条', '第二条'],
+  })
+  assert.equal(value.chunks, 2)
+  const texts = server.sentTexts().slice(before)
+  assert.ok(texts.includes('第一条') && texts.includes('第二条'))
+})
+
+await test('入站消息后 context_token 会被记录并用于主动推送', async () => {
+  // 之前用例里 friend@im.wechat 发过消息（context_token=ctx-def），
+  // state.json 里应该有记录，主动推送时 sendmessage 的 context_token 应该自动回带。
+  const ok = await waitFor(() => {
+    const stateFile = path.join(tmpHome, 'dsh-wechat-clawbot', 'state.json')
+    try {
+      const rec = JSON.parse(fs.readFileSync(stateFile, 'utf8')).contextTokens?.['friend@im.wechat']
+      return Boolean(rec?.token)
+    } catch {
+      return false
+    }
+  }, 3000)
+  assert.ok(ok, 'context_token 应该落盘')
+  const callsBefore = server.calls.filter((c) => c.url.includes('/sendmessage')).length
+  const tool = ctx._internals.tools.get('wechat_send_message')
+  await tool.execute({ to: 'friend@im.wechat', text: '自动回带测试' })
+  const call = server.calls
+    .filter((c) => c.url.includes('/sendmessage'))[callsBefore]
+  assert.equal(call.body.msg.context_token, 'ctx-def', '应该自动带上记住的 context_token')
 })
 
 await test('工具真的能发消息出去', async () => {
@@ -694,6 +748,28 @@ await test('status 路由报告已登录与统计', async () => {
   assert.ok(res.body.stats.inbound >= 2)
   assert.ok(Array.isArray(res.body.contacts))
   assert.ok(Array.isArray(res.body.bindings))
+})
+
+await test('page 路由渲染设置页：含绑定对话名称与微信用户', async () => {
+  const route = ctx._internals.routes.get('/dsh-wechat-clawbot/page')
+  assert.ok(route, '设置页路由应该注册好')
+  const res = makeRes()
+  await route.handler(makeReq({ method: 'GET' }), res)
+  assert.equal(res.status, 200)
+  assert.match(res.body, /绑定的对话/)
+  assert.match(res.body, /friend@im\.wechat/)
+  // 页面是 HTML 而不是 JSON。
+  assert.equal(res.headers['Content-Type'].includes('text/html'), true)
+})
+
+await test('page 路由拒绝跨站请求', async () => {
+  const route = ctx._internals.routes.get('/dsh-wechat-clawbot/page')
+  const res = makeRes()
+  await route.handler(
+    makeReq({ method: 'GET', headers: { host: '127.0.0.1:19387', 'sec-fetch-site': 'cross-site' } }),
+    res,
+  )
+  assert.equal(res.status, 403)
 })
 
 // ── 5. 安全护栏 ───────────────────────────────────────────────────────────
@@ -1738,6 +1814,383 @@ await test('没有 outbox 时整段回复作为一条消息发出', async () => 
   const sent = server.sentTexts().slice(before)
   assert.equal(sent.length, 1, `应只发一条，实际：${JSON.stringify(sent)}`)
   await disposeCtx(ctxN)
+})
+
+// ── 8. 待机心跳 / 定时任务 ────────────────────────────────────────────────
+console.log('')
+console.log('待机与定时任务：')
+
+/**
+ * 建一个「已登录 + 已绑定」的独立实例。
+ * 待机用例必须用干净的 ctx：前面的用例频繁 dispose，工具与绑定都不一定还在。
+ * @param {object} [opts] 透传给 makeFakeCtx（例如 onTurn）。
+ * @returns {Promise<object>} ctx。
+ */
+async function makeIdleCtx(opts = {}) {
+  await disposeAllCtx()
+  // 清掉上一个用例留下的待机状态：idle.json 是全局的，
+  // 残留的 idle 会让「不自动登记」这类断言读到别人的记录。
+  const idlePath = path.join(tmpHome, 'dsh-wechat-clawbot', 'idle.json')
+  try {
+    fs.rmSync(idlePath, { force: true })
+  } catch {
+    // 忽略。
+  }
+  const context = makeFakeCtx(opts)
+  await apply(context, {})
+  await loginInstance(context, 'tok-idle', 'bot-idle@im.bot')
+  // 手工把一个微信用户绑到一个会话上。
+  const stateFile = path.join(tmpHome, 'dsh-wechat-clawbot', 'state.json')
+  const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+  saved.bindings = {
+    'idle@im.wechat': { sessionId: 'session-idle-test', boundAt: Date.now(), label: '待机测试' },
+  }
+  saved.sessions = {}
+  saved.contextTokens = { 'idle@im.wechat': { token: 'ctx-idle', at: Date.now() } }
+  fs.writeFileSync(stateFile, JSON.stringify(saved, null, 2))
+  // 重新 apply 让新实例读到这份状态（新实例 = 新 ctx）。
+  await disposeCtx(context)
+  const fresh = makeFakeCtx(opts)
+  await apply(fresh, {})
+  // 让 fake ctx 认得这个会话存在（sessionAlive 需要）。
+  // 用真实的假 agent（会走完整的 followup → 事件 → turn/end 流程），
+  // 否则 handleInbound 会永远等不到 turn/end，兜底逻辑也不会执行。
+  fresh._internals.agents.set(
+    'session-idle-test',
+    makeFakeAgent('session-idle-test', fresh, opts.onTurn),
+  )
+  return fresh
+}
+
+await test('idle 路由返回默认设置', async () => {
+  const context = await makeIdleCtx()
+  const route = context._internals.routes.get('/dsh-wechat-clawbot/idle')
+  assert.ok(route, 'idle 路由应该注册好')
+  const res = makeRes()
+  await route.handler(makeReq({ method: 'GET' }), res)
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.equal(typeof res.body.settings.enabled, 'boolean')
+  assert.equal(res.body.settings.defaultMinutes, 5)
+  assert.ok(res.body.settings.idleMessage.includes('{minutes}'))
+  assert.ok(Array.isArray(res.body.schedules))
+  await disposeCtx(context)
+})
+
+await test('idle 路由拒绝跨站请求', async () => {
+  const context = await makeIdleCtx()
+  const route = context._internals.routes.get('/dsh-wechat-clawbot/idle')
+  const res = makeRes()
+  await route.handler(
+    makeReq({ method: 'GET', headers: { host: '127.0.0.1:19387', 'sec-fetch-site': 'cross-site' } }),
+    res,
+  )
+  assert.equal(res.status, 403)
+  await disposeCtx(context)
+})
+
+await test('idle/save 能改默认分钟数与文案，非法值回落', async () => {
+  const context = await makeIdleCtx()
+  const route = context._internals.routes.get('/dsh-wechat-clawbot/idle/save')
+  const res = makeRes()
+  await route.handler(
+    makeReq({ body: JSON.stringify({ defaultMinutes: 8, idleMessage: '安静了 {minutes} 分钟' }) }),
+    res,
+  )
+  assert.equal(res.status, 200)
+  assert.equal(res.body.settings.defaultMinutes, 8)
+  assert.equal(res.body.settings.idleMessage, '安静了 {minutes} 分钟')
+  const res2 = makeRes()
+  await route.handler(makeReq({ body: JSON.stringify({ defaultMinutes: -5 }) }), res2)
+  assert.equal(res2.body.settings.defaultMinutes, 8, '非法分钟数应保持原值')
+  await disposeCtx(context)
+})
+
+await test('wechat_idle 工具登记待机心跳并落盘', async () => {
+  const context = await makeIdleCtx()
+  const tool = context._internals.tools.get('wechat_idle')
+  assert.ok(tool, 'wechat_idle 应该注册好')
+  assert.equal(typeof tool.output.render, 'function')
+  assert.ok(Array.isArray(tool.output.render({}, { ok: true, message: 'x' })))
+  const value = await tool.execute(
+    { minutes: 3 },
+    { agent: { session: { id: 'session-idle-test' } } },
+  )
+  assert.equal(value.ok, true)
+  assert.equal(value.minutes, 3)
+  assert.ok(value.dueAt > Date.now())
+  const file = path.join(tmpHome, 'dsh-wechat-clawbot', 'idle.json')
+  const ok = await waitFor(() => {
+    try {
+      return Boolean(JSON.parse(fs.readFileSync(file, 'utf8')).idle?.dueAt)
+    } catch {
+      return false
+    }
+  }, 2000)
+  assert.ok(ok, 'idle.json 里应有心跳记录')
+  await disposeCtx(context)
+})
+
+await test('idle/cancel 能取消待机', async () => {
+  const context = await makeIdleCtx()
+  const file = path.join(tmpHome, 'dsh-wechat-clawbot', 'idle.json')
+  // 先登记一个
+  const armRoute = context._internals.routes.get('/dsh-wechat-clawbot/idle/save')
+  const arm = makeRes()
+  await armRoute.handler(makeReq({ body: JSON.stringify({ enabled: true }) }), arm)
+  const tool = context._internals.tools.get('wechat_idle')
+  await tool.execute({ minutes: 4 }, { agent: { session: { id: 'session-idle-test' } } })
+  assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).idle, '应已登记')
+
+  const route = context._internals.routes.get('/dsh-wechat-clawbot/idle/cancel')
+  const res = makeRes()
+  await route.handler(makeReq({ method: 'POST' }), res)
+  assert.equal(res.body.ok, true)
+  assert.equal(res.body.cancelled, true)
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).idle, null, '取消后不应再有心跳')
+  await disposeCtx(context)
+})
+
+await test('wechat_schedule 工具登记定时任务', async () => {
+  const context = await makeIdleCtx()
+  const tool = context._internals.tools.get('wechat_schedule')
+  assert.ok(tool, 'wechat_schedule 应该注册好')
+  assert.ok(Array.isArray(tool.output.render({}, { ok: true, message: 'x' })))
+  const value = await tool.execute(
+    { minutes: 10, text: '该喝水了' },
+    { agent: { session: { id: 'session-idle-test' } } },
+  )
+  assert.equal(value.ok, true)
+  assert.ok(value.id)
+  const file = path.join(tmpHome, 'dsh-wechat-clawbot', 'idle.json')
+  const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(parsed.schedules.length, 1)
+  assert.equal(parsed.schedules[0].message, '该喝水了')
+  parsed.schedules = []
+  fs.writeFileSync(file, JSON.stringify(parsed, null, 2))
+  await disposeCtx(context)
+})
+
+await test('用户发新消息会取消待机（「别喊我」的天然实现）', async () => {
+  // 关掉 autoArm，才能观察「取消」本身：
+  // 开着它的话这一轮结束又会兜底登记，取消动作被掩盖。
+  const context = await makeIdleCtx()
+  await saveIdleSettings(context, { enabled: true, autoArm: false })
+  const idleFile = path.join(tmpHome, 'dsh-wechat-clawbot', 'idle.json')
+
+  const tool = context._internals.tools.get('wechat_idle')
+  await tool.execute({ minutes: 5 }, { agent: { session: { id: 'session-idle-test' } } })
+  assert.ok(JSON.parse(fs.readFileSync(idleFile, 'utf8')).idle, '应已登记')
+
+  server.updatesQueue.push({
+    ret: 0,
+    get_updates_buf: 'cursor-idle-cancel',
+    msgs: [
+      {
+        message_type: 1,
+        from_user_id: 'idle@im.wechat',
+        context_token: 'ctx-idle-2',
+        item_list: [{ type: 1, text_item: { text: '我回来了' } }],
+      },
+    ],
+  })
+  const cleared = await waitFor(() => {
+    try {
+      return JSON.parse(fs.readFileSync(idleFile, 'utf8')).idle === null
+    } catch {
+      return false
+    }
+  }, 6000)
+
+  assert.ok(cleared, '用户发消息后待机应被取消')
+  // 日志里应能看到取消的原因。
+  assert.ok(
+    context._internals.logs.some(([, m]) => m.includes('取消待机心跳')),
+    '应记录取消日志',
+  )
+  await disposeCtx(context)
+})
+
+/** 通过路由改待机设置（内存里的 idleState 才会同步）。 */
+async function saveIdleSettings(context, patch) {
+  const route = context._internals.routes.get('/dsh-wechat-clawbot/idle/save')
+  const res = makeRes()
+  await route.handler(makeReq({ body: JSON.stringify(patch) }), res)
+  assert.equal(res.status, 200, `保存待机设置失败：${JSON.stringify(res.body)}`)
+  return res.body
+}
+
+await test('AI 没主动调 wechat_idle 时，回合结束自动兜底登记待机', async () => {
+  const context = await makeIdleCtx()
+  await saveIdleSettings(context, { enabled: true, autoArm: true, defaultMinutes: 6 })
+  const idleFile = path.join(tmpHome, 'dsh-wechat-clawbot', 'idle.json')
+
+  // 用真实入站路径跑一轮：假 agent 默认回 `回声：xxx`，不会调 wechat_idle。
+  server.updatesQueue.push({
+    ret: 0,
+    get_updates_buf: 'cursor-autoidle',
+    msgs: [
+      {
+        message_type: 1,
+        from_user_id: 'idle@im.wechat',
+        context_token: 'ctx-autoidle',
+        item_list: [{ type: 1, text_item: { text: '随便聊聊' } }],
+      },
+    ],
+  })
+
+  const armed = await waitFor(() => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(idleFile, 'utf8'))
+      return Boolean(parsed.idle?.dueAt) && parsed.idle.minutes === 6
+    } catch {
+      return false
+    }
+  }, 8000)
+  if (!armed) {
+    for (const [lv, m] of context._internals.logs.slice(-10)) console.log('      ', lv, m)
+  }
+  assert.ok(armed, '回合结束后应按默认分钟数自动登记待机')
+  await disposeCtx(context)
+})
+
+await test('AI 主动调过 wechat_idle 时不再被兜底覆盖', async () => {
+  const context = await makeIdleCtx()
+  await saveIdleSettings(context, { enabled: true, autoArm: true, defaultMinutes: 9 })
+  const idleFile = path.join(tmpHome, 'dsh-wechat-clawbot', 'idle.json')
+  const tool = context._internals.tools.get('wechat_idle')
+  const value = await tool.execute(
+    { minutes: 2 },
+    { agent: { session: { id: 'session-idle-test' } } },
+  )
+  assert.equal(value.ok, true)
+  assert.equal(value.minutes, 2, 'AI 指定的分钟数应生效，不被默认值覆盖')
+  const parsed = JSON.parse(fs.readFileSync(idleFile, 'utf8'))
+  assert.equal(parsed.idle.minutes, 2)
+  await disposeCtx(context)
+})
+
+await test('关掉 autoArm 后不自动登记待机', async () => {
+  const context = await makeIdleCtx()
+  await saveIdleSettings(context, { enabled: true, autoArm: false, defaultMinutes: 5 })
+  const idleFile = path.join(tmpHome, 'dsh-wechat-clawbot', 'idle.json')
+
+  server.updatesQueue.push({
+    ret: 0,
+    get_updates_buf: 'cursor-noauto',
+    msgs: [
+      {
+        message_type: 1,
+        from_user_id: 'idle@im.wechat',
+        context_token: 'ctx-noauto',
+        item_list: [{ type: 1, text_item: { text: '再来一轮' } }],
+      },
+    ],
+  })
+  // 等这轮回复真的发出去
+  const replied = await waitFor(
+    () => server.sentTexts().some((t) => t.includes('回声')),
+    8000,
+  )
+  assert.ok(replied, '应该有回复发出')
+  await new Promise((r) => setTimeout(r, 400))
+  const parsed = JSON.parse(fs.readFileSync(idleFile, 'utf8'))
+  assert.equal(parsed.idle, null, 'autoArm 关闭时不应自动登记')
+  await disposeCtx(context)
+})
+
+await test('待机叫醒后 AI 不说话 → 微信什么都收不到（待机只是提醒）', async () => {
+  // 假 agent 默认只回「回声：xxx」正文、不调 wechat_reply ——
+  // 这正是「AI 被叫醒后决定保持沉默」的情形。
+  const context = await makeIdleCtx()
+  await saveIdleSettings(context, { enabled: true, autoArm: true, defaultMinutes: 5 })
+  const tool = context._internals.tools.get('wechat_idle')
+  await tool.execute({ minutes: 1 }, { agent: { session: { id: 'session-idle-test' } } })
+
+  // sentTexts 是全局累积的（前面几十个用例发过无数「回声：xxx」），
+  // 必须以「登记待机之后」为基线，只看这个窗口里有没有新消息。
+  const baseline = server.sentTexts().length
+
+  // 立刻触发，不等一分钟。
+  const trigger = context._internals.routes.get('/dsh-wechat-clawbot/idle/trigger')
+  const tRes = makeRes()
+  await trigger.handler(makeReq({ method: 'POST' }), tRes)
+  assert.equal(tRes.body.ok, true)
+
+  // 等 tick 真正跑完（injectIdleMessage 是异步的）。
+  await new Promise((r) => setTimeout(r, 2500))
+
+  const windowTexts = server.sentTexts().slice(baseline)
+  assert.equal(
+    windowTexts.some((t) => t.includes('回声')),
+    false,
+    `沉默轮次不应有任何文本发到微信，实际：${JSON.stringify(windowTexts)}`,
+  )
+  // 日志里应明确记录「保持沉默」。
+  assert.ok(
+    context._internals.logs.some(([, m]) => m.includes('保持沉默')),
+    '应记录「agent 选择沉默」',
+  )
+  // 静默计数 +1。
+  const idleNow = context._internals.routes.get('/dsh-wechat-clawbot/idle')
+  const sRes = makeRes()
+  await idleNow.handler(makeReq({ method: 'GET' }), sRes)
+  assert.equal(sRes.body.diagnostics.silentChain, 1, '静默链应累计到 1')
+  await disposeCtx(context)
+})
+
+await test('待机叫醒后 AI 用 wechat_reply 说话 → 照常发出', async () => {
+  const context = await makeIdleCtx({
+    onTurn: ({ input }) => ({
+      beforeAssistant: async () => {
+        const tool = context._internals.tools.get('wechat_reply')
+        await tool.execute(
+          { messages: ['主人，还在吗？本鱼有点想你了'] },
+          { agent: { session: { id: 'session-idle-test' } } },
+        )
+      },
+      text: '（这句话只留在电脑端）',
+    }),
+  })
+  await saveIdleSettings(context, { enabled: true, autoArm: true, defaultMinutes: 5 })
+  const tool = context._internals.tools.get('wechat_idle')
+  await tool.execute({ minutes: 1 }, { agent: { session: { id: 'session-idle-test' } } })
+  const baseline = server.sentTexts().length
+
+  const trigger = context._internals.routes.get('/dsh-wechat-clawbot/idle/trigger')
+  const tRes = makeRes()
+  await trigger.handler(makeReq({ method: 'POST' }), tRes)
+  assert.equal(tRes.body.ok, true)
+
+  await new Promise((r) => setTimeout(r, 2500))
+
+  const windowTexts = server.sentTexts().slice(baseline)
+  // 主动声明的内容应该发出去。
+  assert.ok(
+    windowTexts.some((t) => t.includes('本鱼有点想你了')),
+    'wechat_reply 的内容应发到微信',
+  )
+  // 正文不该跟着外泄。
+  assert.equal(
+    windowTexts.some((t) => t.includes('只留在电脑端')),
+    false,
+    'agent 正文不应自动外泄',
+  )
+  // 说了话 → 静默链清零。
+  const idleNow = context._internals.routes.get('/dsh-wechat-clawbot/idle')
+  const sRes = makeRes()
+  await idleNow.handler(makeReq({ method: 'GET' }), sRes)
+  assert.equal(sRes.body.diagnostics.silentChain, 0, '说话后静默链应清零')
+  await disposeCtx(context)
+})
+
+await test('设置页客户端 bundle 声明了 settings.section 且 order=43', async () => {
+  const src = fs.readFileSync(path.join(process.cwd(), 'lib', 'client.js'), 'utf8')
+  assert.match(src, /settings\.section/, '应注册 settings.section 槽位')
+  assert.match(src, /order:\s*43/, 'order 应为 43（紧跟济大词元文生图的 42）')
+  assert.match(src, /dsh-wechat-clawbot/, '应请求宿主路由')
+  const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'))
+  assert.equal(pkg.dsh.client.platform, 'web', 'package.json 应声明 dsh.client')
 })
 
 globalThis.fetch = originalFetch

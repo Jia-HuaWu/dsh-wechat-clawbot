@@ -1,7 +1,7 @@
 {
   "name": "dsh-wechat-clawbot",
   "version": "0.1.0",
-  "description": "把微信 ClawBot（腾讯 iLink 官方 Bot 通道）接进 DSH：在微信里直接和 DSH 的 agent 对话，不需要安装 OpenClaw。",
+  "description": "把微信 ClawBot（腾讯 iLink 官方 Bot 通道）接进 DSH：在微信里直接和 DSH 的 agent 对话，支持 AI 主动待机；不需要安装 OpenClaw。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -19,6 +19,9 @@
     ".": {
       "default": "./lib/index.js"
     },
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./ilink": {
       "default": "./lib/ilink.mjs"
     },
@@ -27,6 +30,12 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "files": [

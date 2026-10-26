@@ -292,3 +292,100 @@ live agent 找不到就翻磁盘上的 `session.v4.jsonl.zstd`。
 （注意：内容大小不在帧头里，`decompress()` 会抛
 `could not determine content size in frame header`，要用 stream_reader。）
 
+---
+
+## 主动待机（A 类消息）的设计取舍
+
+「让 AI 自己决定什么时候开口」听着简单，但有三个坑必须提前想清楚，
+否则会变成骚扰用户的刷屏机器。
+
+### 1. 不调工具就不该有下一轮
+
+最自然的实现是「到点触发一次，触发完再自动排下一次」——这是个陷阱：
+AI 如果这轮没话说，就会陷入「被叫醒 → 无话可说 → 又被叫醒」的空转，
+消耗 token 还刷屏。
+
+现在的做法：**待机是 AI 每轮自己续订的**。`wechat_idle` 只登记一次，
+被叫醒后如果 AI 不再调用，链条就自然终止。
+`maxChain`（默认 12）是第二道闸：连续触发这么多次都没等到用户真人消息，
+直接停掉并在日志里说明原因。
+
+### 2. 「用户说话即取消」比任何取消指令都可靠
+
+用户说「等下别喊我」时，AI 可能理解错、可能忘了调取消工具。
+但有一件事永远不会错：**用户发了真实消息**。
+
+所以取消逻辑挂在入站路径上——`handleInbound` 一进来就检查
+`idleState.idle.userId === fromUserId`，命中就 `disarmIdle()`。
+用户开口 = 他不想被叫，这个推断比让 AI 自己判断靠谱得多。
+
+### 3. A 类消息必须和真人消息可区分
+
+插件模拟用户发的提醒如果和真人消息长得一模一样，事后排查时分不清
+「这句话到底是谁说的」，会话日志会变成一笔糊涂账。
+
+做法：`source.via` 写成 `dsh-wechat-clawbot-idle`（定时任务则是
+`-schedule`），`source.kind` 仍是 `user`（这样前端照常渲染成用户气泡，
+且满足 session v4 的 producer-owned 要求）。想统计「AI 主动说了几次话」
+时按 `via` 过滤即可。
+
+### 4. 待机是提醒，不是发言命令（真实踩过的坑）
+
+第一版实现里，被叫醒那一轮的**正文被无条件发到微信**——
+因为 agent 对注入消息总会「礼貌回应」点什么，结果变成：
+每 5 分钟必来一句，用户明确反馈「待机结束后好像一定会发消息」。
+
+这不是模型的问题，是插件把「提醒」当成了「命令发言」。
+修法分三层：
+
+- **沉默是默认路径**：只有 agent 显式调 `wechat_reply` / `wechat_send_image` /
+  `wechat_send_message`（有 outbox）才发送；它不调，这一轮微信上零消息，
+  正文只留在电脑端会话里。判断依据是 `reply.usedOutbox`。
+- **A 类消息正文自带说明**：注入的提醒末尾附一句「你不需要回复这条提醒：
+  没什么想说的就什么都不做」。模型在**决策现场**看到这句话，比只写在
+  工具描述里（决策可能在几轮之前）有效得多。
+- **静默熔断**：就算有自动兜底，AI 连续 N 次被叫醒都沉默（默认 2 次），
+  说明它真不想聊，暂停兜底——否则每 N 分钟白叫醒一次，烧 token 还写
+  无意义的会话记录。AI 自己调 `wechat_idle`、用户发新消息、保存设置
+  都会解除暂停。
+
+一个排障细节：集成测试里 `server.sentTexts()` 是**全局累积**的，
+几十个用例跑下来早就发过无数「回声：xxx」，直接断言「没发过回声」必然翻车。
+必须以「登记待机之后」为基线取窗口断言——否则修好的功能看起来还是坏的。
+
+### 4. 待机状态和登录状态分开存
+
+`state.json` 里有 `bot_token`（0600）。待机设置改动频繁（每次心跳都读写），
+混在一起会导致**每次心跳都重写一份含密钥的文件**——既浪费又有风险面。
+所以待机状态单独落在 `idle.json`，`state.json` 只在需要时动。
+
+### 5. 到点时用户正在说话怎么办
+
+定时任务（用户明确要求的「10 分钟后叫我」）到点时，如果该用户有等待中的回合
+（`runtime.waiters.has(sessionId)`），不硬插进去打断，而是把 `dueAt` 推后
+1 分钟重排。待机心跳则直接作废（用户正在聊，不需要被叫）。
+
+### 6. 设置页要进 DSH 自带面板，而不是自己做一个页面
+
+自建 HTML 页（`/page` 路由）能用，但用户得记一个 URL，等于没进设置体系。
+正确做法是走 `dsh.client` 声明的浏览器半边 + `settings.section` 槽位：
+
+- `package.json` 里加 `dsh.client: { platform: 'web', inject: [...] }`；
+- **同时**在 `exports` 里加 `"./client": { "default": "./lib/client.js" }`；
+- `lib/client.js` 用 `window.__ModuleLoader__.load({ id: <包名>, factory })` 包装，
+  通过 `ctx.slots.inject('settings.section', ...)` 注册页面；
+- `order` 决定排序——本项目用 `43`，紧跟在同机 `dsh-ujn-image` 的 `42` 之后。
+
+漏掉第二条会是**整机启动失败**，不是这个页面的小毛病：`dsh-client-modules`
+在 `resolveMeta` 阶段发现「声明了 `dsh.client` 却解析不出 `./client`」，
+抛 `ClientPackageCompositionError`，而 `modules` 是 required 插件，于是
+`startup failed: 1 required plugin did not activate`，桌面端直接弹
+「The application could not start or stopped unexpectedly」。文件在磁盘上
+存在也没用——宿主只认 `exports` 映射，不接受裸路径。同类插件
+（`dsh-ujn-image`、`dsh-hidden-sessions`）都同时有这两处，可作模板比对。
+
+一个容易踩的细节：`h()` 不能直接等于 `jsxRuntime.jsx`。`jsx` 的签名是
+`(type, config, maybeKey)`，第三个参数会被当成 React 的 **key** 吞掉，
+于是子节点整棵丢失、每个元素都只剩 props。必须显式包一层把 children 收进
+`props.children`。
+
