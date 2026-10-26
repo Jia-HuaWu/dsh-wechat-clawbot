@@ -1,0 +1,53 @@
+{
+  "name": "dsh-wechat-clawbot",
+  "version": "0.1.0",
+  "description": "把微信 ClawBot（腾讯 iLink 官方 Bot 通道）接进 DSH：在微信里直接和 DSH 的 agent 对话，不需要安装 OpenClaw。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "wechat",
+    "weixin",
+    "clawbot",
+    "ilink",
+    "bot"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./ilink": {
+      "default": "./lib/ilink.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "doctor": "node scripts/doctor.mjs",
+    "selftest": "node scripts/selftest.mjs",
+    "selftest:live": "node scripts/selftest.mjs --live",
+    "integration": "node scripts/integration.mjs",
+    "verify": "node scripts/verify-dsh-contract.mjs",
+    "verify:push": "node scripts/verify-multi-push.mjs",
+    "verify:shape": "node scripts/verify-message-shape.mjs",
+    "verify:immediate": "node scripts/verify-immediate-reply.mjs",
+    "test": "node scripts/selftest.mjs && node scripts/integration.mjs && node scripts/verify-multi-push.mjs && node scripts/verify-immediate-reply.mjs && node scripts/verify-message-shape.mjs && node scripts/verify-dsh-contract.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
