@@ -1,0 +1,294 @@
+# 踩坑实录（Gotchas）
+
+> 从 README 抽出来的完整踩坑记录。这些坑全部在真实运行中撞到过，
+> 每一条都有对应的代码修复或测试守着。协议文档不会写这些 —— 撞过才知道。
+
+## 协议与 DSH 契约
+
+### 工具的 `output.render` 必须返回 `ContentBlock[]`
+
+不是字符串。DSH 的 `ToolDefinition.output.render` 签名是
+`render(args, value): ContentBlock[]`，宿主拿到结果后会直接对它做
+`content.some(...)`。返回裸字符串会在工具结果写回会话时抛
+`content.some is not a function` —— 而且**工具本身已经执行成功了**，
+所以现象看起来像"工具失败"，实际是渲染阶段炸的。
+
+所有给人看的文字都要包成 `[{ type: 'text', text }]`。
+`scripts/integration.mjs` 里有一条断言专门盯这个形状。
+
+### 扫码确认就立即绑定（不要只靠首条消息认领）
+
+`get_bot_qrcode` 的确认回调能告诉你「谁连进来了」（`ilink_user_id`）。
+
+**现在**：确认时立刻 `bindSession(ilink_user_id, bindSessionId)`，扫码完就能用。
+
+**曾经**：只写一条 `pendingBinds[code]`，等首条消息来了才认领。这套反复失败，
+因为 `binded_redirect`、用户不发消息、token 失效都会让认领永不发生 ——
+详见下面「绑定：扫码确认就立即绑」一节。
+
+`pendingBinds` 作为兜底保留（服务端没给 `ilink_user_id` 时），且有 TTL
+（12 小时），避免几天后随手一条消息串到别的对话上。
+
+这些是从官方插件源码里读出来的、协议文档不会写的细节：
+
+### `X-WECHAT-UIN` 每次都要变
+
+```
+随机 uint32 → 十进制字符串 → base64
+```
+
+官方用于防重放。写死一个值可能被服务端拒。
+
+### `context_token` 必须原样回带
+
+每条入站消息都带 `context_token`。回复时**必须**把它塞进 `sendmessage` 的
+`msg.context_token`，否则消息关联不到正确的会话窗口。
+
+### 消息 ID 是 uint64，会丢精度
+
+`getupdates` 返回的 `message_id` / `svr_id` 是 uint64，超过 `2^53` 时 `JSON.parse`
+会静默丢精度。`parseLosslessJson()` 在解析前把这些字段的裸数字改写成字符串 ——
+只改对象属性位置，不会误伤字符串内部的同名文本。
+
+### 扫码状态不止 wait / confirmed
+
+`get_qrcode_status` 可能返回 8 种状态：
+
+| 状态 | 含义 | 插件处理 |
+|---|---|---|
+| `wait` | 等待扫码 | 继续轮询 |
+| `scaned` | 已扫码待确认 | 提示用户 |
+| `confirmed` | 确认成功 | 存 token，开始监听 |
+| `expired` | 二维码过期 | 提示重新发起 |
+| `scaned_but_redirect` | IDC 重定向 | 切换轮询 host 继续 |
+| `need_verifycode` | 需要配对码 | 让用户填数字 |
+| `verify_code_blocked` | 配对码错误过多 | 中止 |
+| `binded_redirect` | 该微信已绑定过 | 视为成功 |
+
+`scaned_but_redirect` 尤其容易漏 —— 漏了会在某些网络环境下卡死在「已扫码」。
+
+### 长轮询会退化成紧循环
+
+正常情况下 `getupdates` 被服务端 hold 30 秒以上。但网关异常、被限流、或被中间设备
+掐断时，接口可能**立刻**返回空结果。不加节流就会把一个 CPU 核跑满，还会打爆对方接口。
+
+插件里用 `MIN_POLL_INTERVAL_MS = 1000` 兜底。
+
+> 这个 bug 是写集成测试时真实撞到的 —— 假服务器立即返回，整个测试进程被微循环饿死。
+
+### AES key 有两种编码
+
+`CDNMedia.aes_key` 在线上有两种形态，解错了就解不出图：
+
+- `base64(16 字节原始 key)` —— 图片常用
+- `base64(key 的 32 字符 hex)` —— 文件/语音/视频常用
+
+`parseAesKey()` 两种都认。另外发图时 `aes_key` 要填 **base64(hex 字符串)**，
+而不是 base64(原始 key) —— 官方实现如此，写反了对方解不开。
+
+### 图片消息的 `mid_size` 填密文大小
+
+`image_item.mid_size` 用的是 **AES 加密后**的字节数（`aesEcbPaddedSize`），
+不是原图大小。
+
+### CDN 上传的响应头
+
+上传成功与否**不看 body**，只看响应头 `x-encrypted-param`。这个值就是后续
+`sendmessage` 里的 `encrypt_query_param`。4xx 应立即失败，5xx 才重试。
+
+### 「正在输入」是可选的
+
+要先 `getconfig` 拿 `typing_ticket`，再拿它去 `sendtyping`。这步失败**不应该**
+影响主流程，所以插件里全程 try/catch 忽略。
+
+### 消息 source.kind 不能是字面量 `"plugin"` ⚠️
+
+这是**最阴的一个坑**，因为它不会在写入时报错。
+
+DSH 的 session v4 要求每条消息带「生产者自己拥有」的 source kind：
+
+```
+{ kind: "plugin", plugin: "dsh-wechat-clawbot" }   ❌ 会被拒绝
+{ kind: "plugin:dsh-wechat-clawbot" }              ✅ 正确
+```
+
+**关键**：内存里的 `Session.append()` **不校验**这个字段，所以写入看似完全正常；
+校验发生在**读取已持久化事件**时（`assertReleasedV4Relationships`）。结果是：
+
+- 微信消息进来 → 写入成功 → agent 回复发出 → 你看到回复（第一次可能还是好的）
+- 但会话日志里留下了非法 source
+- **下次读这个会话 / 重启 DSH 时**，整个会话报
+  `format v4 message requires a producer-owned source kind`
+
+`plugin:<包名>` 这个写法不是随便编的 —— 它正是 DSH 自己 v3→v4 迁移器的改写规则
+（`producerKind()` 对未知插件的返回值）。
+
+`scripts/verify-dsh-contract.mjs` 会**直接调用真实的**
+`assertReleasedV4Relationships` 来验证这一点，而不是复刻规则 ——
+这样即使将来 DSH 改了契约，测试也能立刻发现。
+
+### 绑定：扫码确认就立即绑，**不要**等首条消息 ⚠️
+
+这条是反复踩坑后改的，值得单独说清楚。
+
+早期设计是两段式：扫码 → 写一条带 `sessionId` 的待领取记录（`pendingBinds`）
+→ 该微信发来**首条消息**时才认领，绑定才真正生效。
+
+**为什么这套在实践中反复失败**（现象就是「换了对话、扫了新码、完全没效果」）：
+
+1. 服务端可能返回 `binded_redirect` —— 这个微信以前连过本 DSH，就不再下发
+   新 token，也**不给 `ilink_user_id`**。早期代码看到这个分支直接返回
+   「无需重复连接」就完事了，本次要绑的目标对话被整个丢弃，`pendingBind`
+   永远悬着。
+2. 用户扫完不一定会马上发消息，认领就不发生。
+3. token 一旦失效（`errcode -14`），消息收不到，认领更不可能发生。
+
+**现在的做法：扫码 `confirmed` 时当场绑定。** 只要服务端在响应里给了
+`ilink_user_id`（知道是谁扫的），就直接写绑定表，不等任何消息。
+
+`binded_redirect` 分支也一并修了：它拿不到 `ilink_user_id`，就退回用
+**已知的绑定用户**（`runtime.userId` 或现有绑定表里唯一的 key）来完成改绑 ——
+总比把这次扫码丢掉好。
+
+`pendingBinds` 的两段式认领**保留**为兜底（服务端确实没给 `ilink_user_id` 时
+仍要靠首条消息）。记录有 TTL，过期丢弃。
+
+对应测试：
+- `扫码确认后立即绑定（不再依赖首条消息）`
+- `binded_redirect 时也会改绑到新对话（不再丢弃）`
+
+### 消息必须带 `id` 和 `role`（否则会话会 corrupt）⚠️
+
+这是**比 source.kind 更凶的坑**，因为它会毁掉整个会话。
+
+DSH 的 session 在**持久化读取期**校验：
+
+```
+assertMessageEventShape(event)
+user/message 要求：
+  message.id      非空字符串
+  message.role    === "user"
+  message.source.kind 非空且不是 "plugin"
+  message.content 是数组
+```
+
+关键在于「读取期」三个字：**内存里 `Session.append()` 不检查这些字段**。
+所以历史上出现过：
+
+1. 微信消息进来，`followup({ content, source })` —— 没有 `id`、没有 `role`
+2. 内存写入成功，消息也正常发回微信 ✅
+3. 但日志里留下了坏事件
+4. **下次读这个会话 / 重启 DSH** →
+   `session event at seq N lacks an identified message`
+   → 整个会话判为 corrupt，历史加载失败 ❌
+
+官方用 `@deepseek-ai/dsh-llm` 的 `createUserMessage()` 保证这些字段。
+第三方插件解析不到那个包（不在 profile 的 node_modules 里），所以插件里
+复刻了同样的规则：
+
+```js
+function createUserMessage(input) {
+  return {
+    id: randomUUID(),      // ← 必须
+    role: 'user',          // ← 必须
+    content: input.content,
+    source: input.source,
+  }
+}
+```
+
+`scripts/verify-message-shape.mjs` 会加载**真实的 dsh-session**，把缺字段的
+消息走一遍完整往返（append → 序列化 → 重新加载），确认它确实被拒；
+同时确认插件实际构造的消息能通过。
+
+### 会话损坏时不要 create 同名会话
+
+`ctx.agents.resume()` 失败有两种完全不同的原因：
+
+| 原因 | 正确处理 |
+|---|---|
+| 没有历史（新会话） | `create()` 一个 |
+| **有历史但损坏** | **不能** `create()` —— 同名会话仍存在，会报 `session "..." already exists` |
+
+早期实现把两者混为一谈，于是用户在微信里看到的就是那句莫名其妙的
+`session "..." already exists`。现在按错误措辞区分，损坏时如实告诉用户
+「日志已损坏」并建议修或换一个对话。
+
+### 绑定的会话可能已经不存在了 ⚠️
+
+这是「换个对话扫码却没效果」的**另一半原因**，也是最能骗人的一个。
+
+场景：你在 DSH 里删掉（或归档）了被绑定的对话。日志目录没了，但插件的
+`state.json` 里还留着那个 `sessionId`。于是：
+
+- 每条微信消息都往一个**幽灵会话**里发；
+- 电脑上看不到任何东西（会话不存在），微信也没回复；
+- 你换个对话重新扫码 —— 但**旧绑定还在**，而且 `binded_redirect` 分支
+  又把这次扫码当「无需重复连接」丢弃了，所以怎么扫都没用。
+
+现在的处理：
+
+1. **入站时校验会话是否还存在**（live agent 或磁盘日志），不存在就清掉绑定、
+   退回独立会话，保证消息至少能进一个真实会话；
+2. 清掉绑定时**写墓碑**（`bindingTombstones[id] = 时间戳`），否则
+   `persist()` 的合并逻辑会按 `boundAt` 把磁盘上的旧记录又合并回来 ——
+   表现为「删不掉」。
+
+> 这个墓碑机制是必需的：`mergeNewerBindings()` 按时间戳取较新的一份，
+> 而 `delete` 操作没有时间戳。没有墓碑，删除永远输给磁盘上那条旧记录。
+
+### 自查：`scripts/doctor.mjs`
+
+出问题先跑这个，它一次性检查：
+
+```powershell
+node scripts/doctor.mjs
+```
+
+输出覆盖：登录状态、token 是否还有效（直接问服务端）、绑定指向的会话
+是否还存在、会话日志有没有坏消息、有没有悬着的待领取绑定、是否落在
+「未分组」。最后给出可直接执行的修复建议。
+
+---
+
+## 运行时踩到的坑（持续补充）
+
+### 登录状态机不会自己走，必须有人轮询 ⚠️
+
+`wechat_bind_this_conversation` 返回二维码后**没有任何东西在自动推进登录状态机**：
+`pollLogin()` 只在设置页路由（`/login/status`）被调用时才走一步。
+通过对话工具发起的绑定，工具返回后没人轮询 —— 用户扫码确认了，
+DSH 这边也拿不到 `bot_token`，`monitoring` 永远不启动。
+
+**现象**：手机上显示「暂无法连接 openclaw」，DSH 侧 `loggedIn: false`、
+状态文件里 `token` 为空，但 `pendingBinds` 里躺着你那次扫码的记录。
+
+**修复**（两种任选）：
+1. 绑定后手动推一次状态机：向 `POST /dsh-wechat-clawbot/login/status` 发空请求，
+   脚本化的话每 2 秒一次直到 `status: confirmed`；
+2. 让绑定工具在返回二维码后自己起一个短轮询循环（内测版可以补上）。
+
+顺带：二维码有效期只有约 2.5 分钟，登录记录 5 分钟后被判过期 —— 扫码要快。
+
+### sessionAlive 会把「正在写日志的活跃会话」误判成幽灵 ⚠️
+
+`handleInbound()` 入场时用 `sessionAlive()` 校验绑定的会话是否还存在：
+live agent 找不到就翻磁盘上的 `session.v4.jsonl.zstd`。
+
+问题在于：**活跃会话正在被 DSH 持续写入**，日志处于压缩/轮换的瞬间时
+磁盘探测可能失败 —— 于是活跃的绑定会话被判成「已被删除」，
+`unbindSession()` 写下墓碑、消息兜底进独立会话。
+
+**现象**：绑定突然消失（`bindings: {}` + 一条新鲜墓碑）、微信消息「被吃掉」
+（其实进了 `wechat-xxxx` 兜底会话，电脑上看不到）、绑定表里
+`boundAt` 和墓碑时间戳只差 1ms。
+
+**修复**：绑定没了不要慌，直接调 `POST /dsh-wechat-clawbot/bind`
+带 `sessionId` + `userId`（不传 userId 时它只改绑「已有绑定」，绑定表空了会 404）。
+根治需要给 `sessionAlive` 加宽限重试 —— 待修。
+
+**定位工具**：会话日志是 zstd 多帧流，Python 一行即可解：
+`zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data)).read()`
+（注意：内容大小不在帧头里，`decompress()` 会抛
+`could not determine content size in frame header`，要用 stream_reader。）
+
