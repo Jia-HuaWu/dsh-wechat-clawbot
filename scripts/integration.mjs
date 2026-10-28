@@ -1619,6 +1619,36 @@ await test('token 失效（errcode -14）时停止轮询并提示重新扫码', 
   assert.equal(typeof st.body.needsRelogin, 'boolean', 'status 必须暴露 needsRelogin 字段')
 })
 
+await test('对话工具生成二维码后自动接收确认并启动监听', async () => {
+  await disposeAllCtx()
+  server.qrScript.length = 0
+  const context = makeFakeCtx()
+  await apply(context, {})
+  const target = `session-auto-login-${Date.now()}`
+  const tool = context._internals.tools.get('wechat_bind_this_conversation')
+  try {
+    await tool.execute({}, { agent: { session: { id: target } } })
+    server.qrScript.push({
+      status: 'confirmed', bot_token: 'tok-auto-login',
+      ilink_bot_id: 'bot-auto@im.bot', ilink_user_id: 'auto@im.wechat',
+      baseurl: 'https://ilinkai.weixin.qq.com',
+    })
+    const stateFile = path.join(tmpHome, 'dsh-wechat-clawbot', 'state.json')
+    const bound = await waitFor(() => {
+      const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+      return saved.bindings['auto@im.wechat']?.sessionId === target
+    }, 4000)
+    assert.ok(bound, '无需调用状态接口也应完成绑定')
+    const res = makeRes()
+    await context._internals.routes.get('/dsh-wechat-clawbot/status')
+      .handler(makeReq({ method: 'POST' }), res)
+    assert.equal(res.body.loggedIn, true)
+    assert.equal(res.body.monitoring, true)
+  } finally {
+    await disposeCtx(context)
+  }
+})
+
 await test('扫码确认后立即绑定（不再依赖首条消息）', async () => {
   // 真实反复失败的问题：换了对话、扫了新码，却完全没有效果。
   //
