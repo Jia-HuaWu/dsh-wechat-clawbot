@@ -9,6 +9,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -107,6 +108,108 @@ await test('extractInboundText 抽文本并标注非文本类型', () => {
 
   assert.equal(extractInboundText({ item_list: [] }), '')
   assert.equal(extractInboundText(undefined), '')
+})
+
+await test('extractInboundText 展开用户引用的消息', () => {
+  // 引用时协议把原消息挂在 item.ref_msg 上；agent 必须看到被引用的原文，
+  // 否则「这个多少钱」这种话在没有上下文时完全没法回答。
+  const quoted = {
+    item_list: [
+      {
+        type: MessageItemType.TEXT,
+        text_item: { text: '这个多少钱' },
+        ref_msg: {
+          svr_id: '7788990011223344',
+          message_item: {
+            type: MessageItemType.TEXT,
+            msg_id: '1122334455667788',
+            text_item: { text: '报价单A：单价 12 元' },
+          },
+        },
+      },
+    ],
+  }
+  assert.equal(
+    extractInboundText(quoted),
+    '[引用] 报价单A：单价 12 元\n这个多少钱',
+  )
+
+  // 原文缺失、只有 title 摘要 → 用摘要。
+  const titleOnly = {
+    item_list: [
+      {
+        type: MessageItemType.TEXT,
+        text_item: { text: '同意' },
+        ref_msg: {
+          svr_id: '9911',
+          title: '合同条款第三条',
+        },
+      },
+    ],
+  }
+  assert.equal(extractInboundText(titleOnly), '[引用] 合同条款第三条\n同意')
+
+  // 原文和 title 都没有（新版客户端只给 svr_id）→ 明确占位，别静默丢。
+  const bare = {
+    item_list: [
+      {
+        type: MessageItemType.TEXT,
+        text_item: { text: '就这个' },
+        ref_msg: { svr_id: '5566' },
+      },
+    ],
+  }
+  assert.equal(extractInboundText(bare), '[引用] [引用了一条未缓存的消息 #5566]\n就这个')
+
+  // 引用的是一条图片：递归渲染成 [图片]。
+  const imageRef = {
+    item_list: [
+      {
+        type: MessageItemType.TEXT,
+        text_item: { text: '在哪拍的' },
+        ref_msg: { message_item: { type: MessageItemType.IMAGE } },
+      },
+    ],
+  }
+  assert.equal(extractInboundText(imageRef), '[引用] [图片]\n在哪拍的')
+
+  // 纯引用、用户没打字 → 只输出引用内容。
+  const refOnly = {
+    item_list: [
+      { type: MessageItemType.TEXT, ref_msg: { title: '旧消息' } },
+    ],
+  }
+  assert.equal(extractInboundText(refOnly), '[引用] 旧消息')
+})
+
+await test('引用只选中一段时按 quotemd5 校验后截取', () => {
+  const body = '报价单A：单价 12 元，有效期 30 天'
+  const picked = '单价 12 元'
+  const start = body.indexOf(picked)
+  const md5 = createHash('md5').update(picked).digest('hex')
+  const msg = {
+    item_list: [
+      {
+        type: MessageItemType.TEXT,
+        text_item: { text: '这个' },
+        ref_msg: {
+          message_item: { type: MessageItemType.TEXT, text_item: { text: body } },
+          partial_text: {
+            start: picked,
+            end: picked,
+            startindex: start,
+            endindex: start + picked.length,
+            quotemd5: md5,
+          },
+        },
+      },
+    ],
+  }
+  assert.equal(extractInboundText(msg), '[引用] 单价 12 元\n这个')
+
+  // md5 对不上 → 退回全文（宁多勿错）。
+  msg.item_list[0].ref_msg.partial_text.quotemd5 = 'deadbeef'
+  assert.equal(extractInboundText(msg), `[引用] ${body}\n这个`)
 })
 
 await test('isInboundUserMessage 只认用户消息', () => {

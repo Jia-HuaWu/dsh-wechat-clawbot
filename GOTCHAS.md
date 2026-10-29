@@ -44,6 +44,32 @@
 每条入站消息都带 `context_token`。回复时**必须**把它塞进 `sendmessage` 的
 `msg.context_token`，否则消息关联不到正确的会话窗口。
 
+### 引用消息挂在 `item.ref_msg` 上，别丢
+
+用户长按「引用」某条消息再输入内容时，协议会把被引用的消息塞进同一个
+`MessageItem` 的 `ref_msg` 字段：
+
+```ts
+interface MessageItem {
+  type?: number
+  msg_id?: string
+  ref_msg?: RefMessage       // ← 引用
+  text_item?: TextItem
+  ...
+}
+
+interface RefMessage {
+  message_item?: MessageItem   // 被引用消息的原文（新版客户端可能省略）
+  title?: string               // 摘要
+  partial_text?: PartialText   // 用户只选中了一段
+  svr_id?: string              // 被引用消息的服务端 id
+}
+```
+
+只读 `text_item.text` 会让 agent 收到一句没头没尾的话（「这个多少钱」）。
+插件现在把引用展开成 `[引用] <内容>\n<正文>` 前缀；`partial_text` 用
+`startindex`/`endindex` 截取并用 `quotemd5` 校验，校验不过退回全文。
+
 ### 消息 ID 是 uint64，会丢精度
 
 `getupdates` 返回的 `message_id` / `svr_id` 是 uint64，超过 `2^53` 时 `JSON.parse`

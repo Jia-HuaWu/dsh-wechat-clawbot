@@ -663,6 +663,76 @@ await test('bot 自己发的消息不会被当成入站处理', async () => {
   assert.equal(server.sentTexts().length, countBefore, 'bot 消息不该触发回复')
 })
 
+await test('用户引用的消息会展开成上下文交给 agent', async () => {
+  // 真实场景：用户长按引用一条消息再提问（「这个多少钱」），
+  // 如果只把新打的字交给 agent，它完全没有上下文可用。
+  // 协议把被引用内容放在 item.ref_msg 里，必须展开成前缀。
+  const mention = '引用展开测试'
+  server.updatesQueue.push({
+    ret: 0,
+    get_updates_buf: 'cursor-quote-1',
+    msgs: [
+      {
+        message_type: 1,
+        from_user_id: 'quote@im.wechat',
+        context_token: 'ctx-quote',
+        item_list: [
+          {
+            type: 1,
+            text_item: { text: `${mention}：这个多少钱` },
+            ref_msg: {
+              svr_id: '99887766',
+              message_item: {
+                type: 1,
+                msg_id: '11223344',
+                text_item: { text: '报价单A：单价 12 元' },
+              },
+            },
+          },
+        ],
+      },
+    ],
+  })
+
+  const expect = `回声：[引用] 报价单A：单价 12 元\n${mention}：这个多少钱`
+  const ok = await waitFor(() => server.sentTexts().includes(expect), 6000)
+  assert.ok(
+    ok,
+    `agent 应收到展开后的引用文本，实际收到：${JSON.stringify(server.sentTexts().slice(-3))}`,
+  )
+})
+
+await test('引用内容缺失时给出明确占位而不是静默丢弃', async () => {
+  // 新版客户端有时只给 svr_id，不带原文和摘要。这时宁可显式标注，
+  // 也不能让 agent 收到一句没头没尾的话。
+  const mention = '缺失引用测试'
+  server.updatesQueue.push({
+    ret: 0,
+    get_updates_buf: 'cursor-quote-2',
+    msgs: [
+      {
+        message_type: 1,
+        from_user_id: 'quote2@im.wechat',
+        context_token: 'ctx-quote2',
+        item_list: [
+          {
+            type: 1,
+            text_item: { text: mention },
+            ref_msg: { svr_id: '55443322' },
+          },
+        ],
+      },
+    ],
+  })
+
+  const expect = `回声：[引用] [引用了一条未缓存的消息 #55443322]\n${mention}`
+  const ok = await waitFor(() => server.sentTexts().includes(expect), 6000)
+  assert.ok(
+    ok,
+    `缺失引用时应带占位，实际收到：${JSON.stringify(server.sentTexts().slice(-3))}`,
+  )
+})
+
 // ── 4. 工具 ───────────────────────────────────────────────────────────────
 console.log('')
 console.log('工具与路由：')
