@@ -389,3 +389,65 @@ AI 如果这轮没话说，就会陷入「被叫醒 → 无话可说 → 又被�
 于是子节点整棵丢失、每个元素都只剩 props。必须显式包一层把 children 收进
 `props.children`。
 
+---
+
+## `sendMessage ret=-2 errmsg=prepare failed` 是什么
+
+这是**最容易被误解的一个错误**：看着像参数错误或 context_token 失效，
+实际是 **iLink 网关对 bot 的突发限流（burst throttle）**。
+
+### 排查过程（值得记下来，因为结论反直觉）
+
+现象：真人发消息时回复一切正常，但**待机/定时任务触发的主动推送全部失败**。
+
+逐项探测的结果：
+
+| 探测 | 结果 |
+|---|---|
+| `notifyStart` | `ret: 0` ✅ |
+| `getConfig`（能拿到 typing_ticket） | `ret: 0` ✅ → 用户会话存在 |
+| `getUpdates` 长轮询 | 正常挂起 ✅ |
+| `sendmessage`（**不带** context_token） | ❌ `ret=-2 prepare failed` |
+| `sendmessage`（带 6 分钟前的 context_token） | ❌ 同样失败 |
+| `sendmessage`（带 35 分钟前的 context_token） | ❌ 同样失败 |
+
+**带不带 context_token 结果完全一样** → 排除 token 问题。
+同一时刻 `getConfig` / `getUpdates` 都正常 → 排除登录态和网络。
+
+对照第三方实现（[cc-connect 的 weixin 适配器](https://ghproxy.net/https:/raw.githubusercontent.com/chenhg5/cc-connect/main/platform/weixin/weixin.go)）
+的源码注释，才拿到权威解释：
+
+> 网关在短窗口内发约 5~6 条独立消息后就会限流该 bot，
+> **并且处罚期内每一次发送尝试都会加重处罚**。
+
+### 为什么只有「主动推送」中招
+
+回复路径（真人消息触发的 `wechat_reply`）也会调用同一个 `sendmessage`，
+但它**成功**。区别在于：网关在交互式会话里不限制对用户消息的回复，
+限制的是「没有新入站消息时的主动发送」。所以表现成
+「真人聊天一切正常，待机一响就 prepare failed」。
+
+### 加重处罚是真的
+
+实测日志：首次失败后 agent 连续重试了 3 次（14:31:09 / 14:31:27 / 14:32:02），
+12 次失败分散在 44 分钟里、每次都是连续 2~3 发。重试没有让它更快恢复，
+反而把惩罚窗口一直拖着——这和源码注释的判断一致。
+
+### 现在的处理
+
+- `sendMessage` 对 `ret=-2` 打上 `error.throttled` 标记，**只抛一次不重试**；
+- 主动推送前过 `checkPushBudget()` 闸：滑动窗口配额（默认 4 条 / 60 分钟）；
+- 一旦真的命中 `-2`，`notePushThrottled()` 进入 **15 分钟熔断**，期间所有主动推送
+  本地直接拒绝（不打接口），避免加重处罚；
+- 回复路径不受配额限制（否则正常聊天会被卡死）；
+- 设置页可看配额用量 / 限流命中次数 / 熔断剩余时间，并有「解除限流熔断」按钮。
+
+### 真被限了怎么办
+
+只能等。缓解手段按优先级：
+
+1. **停止一切主动推送**（关待机、清定时任务）——持续发送会延长惩罚；
+2. 正常和 bot 聊天（回复路径不受限），保持会话活跃；
+3. 等窗口滑过（实测可能远超 15 分钟，按小时计）；
+4. 实在等不及：重新扫码登录换一个新 bot 会话（`accountId` 会变）。
+

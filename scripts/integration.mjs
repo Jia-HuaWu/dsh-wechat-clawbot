@@ -1,4 +1,4 @@
-﻿/**
+/**
  * scripts/integration.mjs — 用假 ctx + 假 iLink 服务端跑通插件主流程。
  *
  * 验证的是**插件本身**：入站消息 → 驱动 agent → 收集回复 → 发回微信，
@@ -2211,6 +2211,78 @@ await test('待机叫醒后 AI 用 wechat_reply 说话 → 照常发出', async 
   const sRes = makeRes()
   await idleNow.handler(makeReq({ method: 'GET' }), sRes)
   assert.equal(sRes.body.diagnostics.silentChain, 0, '说话后静默链应清零')
+  await disposeCtx(context)
+})
+
+await test('主动推送超配额后快速失败（不继续加重限流）', async () => {
+  const context = await makeIdleCtx()
+  // 配额设成 2 条 / 60 分钟
+  await saveIdleSettings(context, { pushLimit: 2, pushWindowMinutes: 60 })
+  const tool = context._internals.tools.get('wechat_send_message')
+
+  // 前两条应该成功。
+  await tool.execute({ to: 'idle@im.wechat', messages: ['一'] })
+  await tool.execute({ to: 'idle@im.wechat', messages: ['二'] })
+  // 第三条应被配额挡住。
+  await assert.rejects(
+    () => tool.execute({ to: 'idle@im.wechat', messages: ['三'] }),
+    /配额|限流/,
+  )
+  // 诊断里能看到用量。
+  const idleRoute = context._internals.routes.get('/dsh-wechat-clawbot/idle')
+  const res = makeRes()
+  await idleRoute.handler(makeReq({ method: 'GET' }), res)
+  assert.equal(res.body.diagnostics.pushLimit, 2)
+  assert.ok(res.body.diagnostics.pushUsed >= 2)
+  await disposeCtx(context)
+})
+
+await test('收到 ret=-2 prepare failed 后进入熔断，后续推送直接拒绝', async () => {
+  const context = await makeIdleCtx()
+  await saveIdleSettings(context, { pushLimit: 0 }) // 先不限配额，专测熔断
+
+  // 让假服务端对 sendmessage 返回 ret=-2。
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes('/sendmessage')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ ret: -2, errmsg: 'prepare failed' }),
+        headers: { get: () => null },
+        arrayBuffer: async () => new ArrayBuffer(0),
+      }
+    }
+    return originalFetch(url, init)
+  }
+  try {
+    const tool = context._internals.tools.get('wechat_send_message')
+    await assert.rejects(
+      () => tool.execute({ to: 'idle@im.wechat', messages: ['会被限流'] }),
+      /prepare failed/,
+    )
+    // 熔断已生效：再发应该被本地挡住，而不是再打一次接口。
+    await assert.rejects(
+      () => tool.execute({ to: 'idle@im.wechat', messages: ['第二条'] }),
+      /熔断/,
+    )
+    const idleRoute = context._internals.routes.get('/dsh-wechat-clawbot/idle')
+    const res = makeRes()
+    await idleRoute.handler(makeReq({ method: 'GET' }), res)
+    assert.equal(res.body.diagnostics.pushBlocked, true, '应处于熔断状态')
+    assert.ok(res.body.diagnostics.pushThrottleHits >= 1)
+
+    // 手动解除熔断后恢复。
+    const reset = context._internals.routes.get('/dsh-wechat-clawbot/push/reset')
+    const rRes = makeRes()
+    await reset.handler(makeReq({ method: 'POST' }), rRes)
+    assert.equal(rRes.body.ok, true)
+    const res2 = makeRes()
+    await idleRoute.handler(makeReq({ method: 'GET' }), res2)
+    assert.equal(res2.body.diagnostics.pushBlocked, false, '解除后不应再熔断')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
   await disposeCtx(context)
 })
 
